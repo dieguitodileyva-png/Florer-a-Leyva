@@ -1197,6 +1197,23 @@ tbody tr:hover { background: var(--crema); }
         </p>
       </div>
 
+      <div style="margin-top: 2rem; padding: 1.5rem; background: rgba(244, 194, 209, 0.1); border-radius: 4px; text-align: left; max-width: 700px; margin-left: auto; margin-right: auto;">
+        <h4 style="color: var(--rosa-claro); font-family: 'Fraunces', serif; font-size: 1.2rem; margin-bottom: 0.8rem;">
+          🔧 Solución de problemas
+        </h4>
+        <p style="color: rgba(250,245,238,0.75); font-size: 0.85rem; line-height: 1.6; margin-bottom: 1rem;">
+          Si los datos de ejemplo siguen apareciendo después de borrarlos, o si la app se comporta raro,
+          use este botón para hacer una <strong>limpieza profunda</strong>: elimina TODO (datos + cache + service worker)
+          y recarga la página limpia.
+        </p>
+        <button class="btn btn-danger" style="background: rgba(255, 107, 107, 0.15); color: #ff8a8a; border: 1px solid #ff6b6b; padding: 0.7rem 1.5rem; font-size: 0.72rem;" onclick="limpiezaProfunda()">
+          🧹 Limpieza profunda + recargar
+        </button>
+        <p style="color: rgba(250,245,238,0.5); font-size: 0.72rem; margin-top: 0.7rem; font-style: italic;">
+          Versión actual del sistema: <strong style="color: var(--rosa-claro);">v<span id="appVersionTag">2.1.0</span></strong>
+        </p>
+      </div>
+
       <div style="margin-top: 2rem; padding-top: 1.5rem; border-top: 1px solid rgba(250,245,238,0.15);">
         <p style="color: rgba(250,245,238,0.85); margin-bottom: 1rem; font-size: 0.9rem; font-family: 'Fraunces', serif;">
           🧹 <strong style="color: var(--rosa-claro);">Limpieza de datos por fundo</strong>
@@ -1267,10 +1284,12 @@ let deferredInstallPrompt = null;
 
 // Registrar service worker para funcionar offline
 // Solo intentar si el protocolo lo permite (no en sandboxes o blob:)
+const APP_VERSION = '2.1.0';  // Cambiar este número cuando se publique una nueva versión
 if ('serviceWorker' in navigator && ['https:', 'http:', 'file:'].includes(location.protocol)) {
   // Creamos el SW inline como Blob para que funcione desde un solo archivo HTML
   const swCode = `
-    const CACHE = 'floreria-leyva-v1';
+    const VERSION = '${APP_VERSION}';
+    const CACHE = 'floreria-leyva-' + VERSION;
     const CORE = [
       'https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js',
       'https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js',
@@ -1280,9 +1299,23 @@ if ('serviceWorker' in navigator && ['https:', 'http:', 'file:'].includes(locati
       e.waitUntil(caches.open(CACHE).then(c => c.addAll(CORE.map(u => new Request(u, {mode:'no-cors'})))).catch(()=>{}));
       self.skipWaiting();
     });
-    self.addEventListener('activate', e => { e.waitUntil(clients.claim()); });
+    self.addEventListener('activate', e => {
+      // Eliminar caches viejos al activar nueva versión
+      e.waitUntil(
+        caches.keys().then(keys => Promise.all(
+          keys.filter(k => k !== CACHE).map(k => caches.delete(k))
+        )).then(() => clients.claim())
+      );
+    });
     self.addEventListener('fetch', e => {
       if (e.request.method !== 'GET') return;
+      const url = new URL(e.request.url);
+      // NO cachear el HTML principal — siempre desde la red para ver actualizaciones
+      if (url.pathname.endsWith('.html') || url.pathname === '/' || url.pathname.endsWith('/')) {
+        e.respondWith(fetch(e.request).catch(() => caches.match(e.request)));
+        return;
+      }
+      // Para otros recursos: red primero con fallback a cache
       e.respondWith(
         caches.match(e.request).then(cached => {
           const fetchPromise = fetch(e.request).then(resp => {
@@ -1299,12 +1332,12 @@ if ('serviceWorker' in navigator && ['https:', 'http:', 'file:'].includes(locati
     const swBlob = new Blob([swCode], {type: 'application/javascript'});
     const swUrl = URL.createObjectURL(swBlob);
     window.addEventListener('load', () => {
-      navigator.serviceWorker.register(swUrl).catch(() => {
-        // Silenciar: algunos entornos (como iframes de vista previa) no soportan SW desde blob:
-        // La PWA funcionará cuando se sirva desde un servidor real (HTTPS o file://)
-      });
+      navigator.serviceWorker.register(swUrl).then(reg => {
+        // Actualizar SW inmediatamente si hay una versión nueva
+        reg.update();
+      }).catch(() => {});
     });
-  } catch(e) { /* Silenciar errores de blob en entornos restrictivos */ }
+  } catch(e) {}
 }
 
 // Manifest dinámico inline (como Blob) — para que la PWA sea instalable
@@ -1393,6 +1426,41 @@ function actualizarEstadoConexion() {
 window.addEventListener('online', () => { actualizarEstadoConexion(); toast('✓ Conexión restaurada'); });
 window.addEventListener('offline', () => { actualizarEstadoConexion(); toast('📴 Modo offline — sus cambios se guardarán localmente', 'warning'); });
 
+
+// ===================================================================
+// ========== SISTEMA DE ALMACENAMIENTO UNIFICADO ==========
+// ===================================================================
+// Funciona en TODOS los entornos:
+// - localStorage cuando se descarga el archivo y se abre con doble clic
+// - window.storage como respaldo (preview de Claude)
+// Esto soluciona el bug donde los datos de ejemplo volvían a aparecer
+// cada vez que se reabría el archivo descargado.
+const Storage = {
+  async set(key, value) {
+    let ok = false;
+    try { localStorage.setItem(key, value); ok = true; } catch(e) {}
+    try { if (window.storage?.set) { await Storage.set(key, value); ok = true; } } catch(e) {}
+    return ok;
+  },
+  async get(key) {
+    // Prioridad: localStorage (persiste entre sesiones cuando se descarga)
+    try {
+      const v = localStorage.getItem(key);
+      if (v !== null) return { value: v };
+    } catch(e) {}
+    // Fallback: window.storage
+    try {
+      { const r = await Storage.get(key);
+        if (r?.value) return r;
+      }
+    } catch(e) {}
+    return null;
+  },
+  async delete(key) {
+    try { localStorage.removeItem(key); } catch(e) {}
+    try { await Storage.delete(key); } catch(e) {}
+  }
+};
 
 // ===================================================================
 // ========== CONSTANTES Y DATOS DE LA APP ==========
@@ -1485,13 +1553,12 @@ function toast(msg, tipo='') {
 
 // ========== PERSISTENCIA ==========
 async function guardarDatos() {
-  try { if (window.storage?.set) await window.storage.set(SK_DATOS, JSON.stringify(datos)); } catch(e){}
+  try { await Storage.set(SK_DATOS, JSON.stringify(datos)); } catch(e){}
   if (USAR_NUBE) guardarEnNube();
 }
 async function cargarDatos() {
   try {
-    if (window.storage?.get) {
-      const r = await window.storage.get(SK_DATOS);
+    { const r = await Storage.get(SK_DATOS);
       if (r?.value) {
         const d = JSON.parse(r.value);
         datos = {
@@ -1509,29 +1576,27 @@ async function cargarDatos() {
   return false;
 }
 async function guardarCatalogos() {
-  try { if (window.storage?.set) await window.storage.set(SK_CATALOGOS, JSON.stringify(catalogos)); } catch(e){}
+  try { await Storage.set(SK_CATALOGOS, JSON.stringify(catalogos)); } catch(e){}
   if (USAR_NUBE) guardarEnNube();
 }
 async function cargarCatalogos() {
   try {
-    if (window.storage?.get) {
-      const r = await window.storage.get(SK_CATALOGOS);
+    { const r = await Storage.get(SK_CATALOGOS);
       if (r?.value) { catalogos = JSON.parse(r.value); return true; }
     }
   } catch(e){}
   return false;
 }
-async function guardarSesion() { try { if (window.storage?.set && sesionActual) await window.storage.set(SK_SESION, JSON.stringify(sesionActual)); } catch(e){} }
+async function guardarSesion() { try { if (window.storage?.set && sesionActual) await Storage.set(SK_SESION, JSON.stringify(sesionActual)); } catch(e){} }
 async function cargarSesion() {
   try {
-    if (window.storage?.get) {
-      const r = await window.storage.get(SK_SESION);
+    { const r = await Storage.get(SK_SESION);
       if (r?.value) return JSON.parse(r.value);
     }
   } catch(e){}
   return null;
 }
-async function cerrarSesionStorage() { try { if (window.storage?.delete) await window.storage.delete(SK_SESION); } catch(e){} }
+async function cerrarSesionStorage() { try { await Storage.delete(SK_SESION); } catch(e){} }
 
 // ===================================================================
 // ========== MÓDULO FIREBASE (SINCRONIZACIÓN EN LA NUBE) ==========
@@ -1539,8 +1604,7 @@ async function cerrarSesionStorage() { try { if (window.storage?.delete) await w
 // Carga configuración de Firebase desde storage (si el usuario la configuró)
 async function cargarConfigFirebase() {
   try {
-    if (window.storage?.get) {
-      const r = await window.storage.get(SK_FIREBASE_CONFIG);
+    { const r = await Storage.get(SK_FIREBASE_CONFIG);
       if (r?.value) {
         const cfg = JSON.parse(r.value);
         if (cfg && cfg.apiKey && cfg.projectId) {
@@ -1561,7 +1625,7 @@ async function cargarConfigFirebase() {
 async function guardarConfigFirebaseStorage(cfg) {
   try {
     if (window.storage?.set) {
-      await window.storage.set(SK_FIREBASE_CONFIG, JSON.stringify(cfg));
+      await Storage.set(SK_FIREBASE_CONFIG, JSON.stringify(cfg));
     }
   } catch(e) { console.warn('Error guardando config:', e); }
 }
@@ -1791,7 +1855,7 @@ async function desactivarFirebase() {
   fbApp = null;
   fbDb = null;
   try {
-    if (window.storage?.delete) await window.storage.delete(SK_FIREBASE_CONFIG);
+    await Storage.delete(SK_FIREBASE_CONFIG);
   } catch(e) {}
   actualizarEstadoConexion();
   actualizarEstadoNubeUI();
@@ -1822,25 +1886,23 @@ function actualizarEstadoNubeUI() {
 
 // ========== FUNDOS ==========
 async function guardarFundos() {
-  try { if (window.storage?.set) await window.storage.set(SK_FUNDOS, JSON.stringify(fundos)); } catch(e){}
+  try { await Storage.set(SK_FUNDOS, JSON.stringify(fundos)); } catch(e){}
   if (USAR_NUBE) guardarEnNube();
 }
 async function cargarFundos() {
   try {
-    if (window.storage?.get) {
-      const r = await window.storage.get(SK_FUNDOS);
+    { const r = await Storage.get(SK_FUNDOS);
       if (r?.value) { fundos = JSON.parse(r.value); return true; }
     }
   } catch(e){}
   return false;
 }
 async function guardarFundoActivo() {
-  try { if (window.storage?.set) await window.storage.set(SK_FUNDO_ACTIVO, JSON.stringify({id: fundoActivo})); } catch(e){}
+  try { await Storage.set(SK_FUNDO_ACTIVO, JSON.stringify({id: fundoActivo})); } catch(e){}
 }
 async function cargarFundoActivo() {
   try {
-    if (window.storage?.get) {
-      const r = await window.storage.get(SK_FUNDO_ACTIVO);
+    { const r = await Storage.get(SK_FUNDO_ACTIVO);
       if (r?.value) {
         const d = JSON.parse(r.value);
         if (d.id) fundoActivo = d.id;
@@ -2875,6 +2937,66 @@ async function ejecutarBorrarTodo() {
   toast('✓ Todos los datos eliminados. Sistema listo para datos reales.');
 }
 
+// ====== LIMPIEZA PROFUNDA (resuelve problemas de cache/datos persistentes) ======
+async function limpiezaProfunda() {
+  if (!esAdmin()) return;
+  const msg = `⚠️ LIMPIEZA PROFUNDA\n\nEsta acción:\n` +
+              `• Borrará TODOS los datos (gastos, ventas, producción, inversiones, papelera)\n` +
+              `• Borrará el cache del navegador para esta app\n` +
+              `• Reiniciará el Service Worker (PWA)\n` +
+              `• Borrará la sesión actual\n` +
+              `• Recargará la página completamente limpia\n\n` +
+              `¿Confirma? Esta acción NO se puede deshacer.\n` +
+              `(Recomendado: descargue un respaldo JSON antes)`;
+  if (!confirm(msg)) return;
+  if (!confirm('⚠️ Confirme UNA VEZ MÁS: esto borrará TODO permanentemente')) return;
+
+  try {
+    // 1) Borrar TODOS los datos de localStorage relacionados con la app
+    const claves = Object.keys(localStorage).filter(k => k.startsWith('floreria_leyva'));
+    claves.forEach(k => { try { localStorage.removeItem(k); } catch(e) {} });
+
+    // 2) Borrar window.storage si existe
+    const skKeys = [SK_DATOS, SK_CATALOGOS, SK_SESION, SK_INIT, SK_FUNDOS, SK_FUNDO_ACTIVO, SK_FIREBASE_CONFIG];
+    for (const k of skKeys) {
+      try { await Storage.delete(k); } catch(e) {}
+    }
+
+    // 3) Borrar todos los caches del navegador
+    if ('caches' in window) {
+      const cacheNames = await caches.keys();
+      await Promise.all(cacheNames.map(name => caches.delete(name)));
+    }
+
+    // 4) Desregistrar todos los service workers
+    if ('serviceWorker' in navigator) {
+      const regs = await navigator.serviceWorker.getRegistrations();
+      await Promise.all(regs.map(reg => reg.unregister()));
+    }
+
+    // 5) Borrar IndexedDB de Firebase si existe
+    try {
+      if ('indexedDB' in window) {
+        const dbs = await indexedDB.databases?.() || [];
+        for (const db of dbs) {
+          if (db.name && (db.name.includes('firebase') || db.name.includes('firestore'))) {
+            indexedDB.deleteDatabase(db.name);
+          }
+        }
+      }
+    } catch(e) {}
+
+    toast('✓ Limpieza completada. Recargando...');
+    setTimeout(() => {
+      // Forzar recarga sin cache
+      location.reload();
+    }, 1500);
+  } catch(e) {
+    console.error('Error en limpieza:', e);
+    toast('Error en limpieza. Recargue manualmente.', 'error');
+  }
+}
+
 // ===================================================================
 // ========== MOTOR DE ALERTAS INTELIGENTES ==========
 // ===================================================================
@@ -3722,8 +3844,7 @@ function cargarEjemplos() {
   // 6) Verificar marca de inicialización
   let yaInicializado = false;
   try {
-    if (window.storage?.get) {
-      const r = await window.storage.get(SK_INIT);
+    { const r = await Storage.get(SK_INIT);
       yaInicializado = !!(r && r.value);
     }
   } catch(e) {}
@@ -3734,7 +3855,7 @@ function cargarEjemplos() {
   if ((hayDatos || hayPapelera || datosOk) && !yaInicializado) {
     try {
       if (window.storage?.set) {
-        await window.storage.set(SK_INIT, JSON.stringify({ inicializado: true, fecha: Date.now() }));
+        await Storage.set(SK_INIT, JSON.stringify({ inicializado: true, fecha: Date.now() }));
       }
     } catch(e) {}
     yaInicializado = true;
@@ -3745,7 +3866,7 @@ function cargarEjemplos() {
     await guardarDatos();
     try {
       if (window.storage?.set) {
-        await window.storage.set(SK_INIT, JSON.stringify({ inicializado: true, fecha: Date.now() }));
+        await Storage.set(SK_INIT, JSON.stringify({ inicializado: true, fecha: Date.now() }));
       }
     } catch(e) {}
   }
